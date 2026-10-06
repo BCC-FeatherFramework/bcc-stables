@@ -68,15 +68,21 @@ Locales["pt_lang"] = {
     horseInfoTrickLvl_4b = "Andar para o lado | space + A or D",
     horseDied = "O teu cavalo morreu, volta ao estábulo para selecionar um cavalo.",
     horseWrithe = "Your horse needs help!",
-    -- Discord Alerts
-    discordHorsePurchased = "Cavalo comprado!",
-    discordTamedPurchased = "Cavalo domado salvo!",
-    discordHorseXPGain = "XP de cavalo adquirida!",
-    discordHorseSold = "Cavalo vendido!",
-    discordTamedSold = "Cavalo domado vendido!",
-    discordTraded = "Cavalo trocado com ",
     -- Flaming Hooves
     flameHooveDesc = 'An enchanted item to activate flaming hooves',
     flameHoovesActivated = 'Flaming hooves activated!',
     flameHoovesDeactivated = 'Flaming hooves deactivated!',
+    -- Feather Framework
+    moneyUnavailable = "Payments are unavailable right now, try again later",
+    transactionFailed = "The transaction could not be completed",
+    purchasePending = "Your last purchase is still being processed, try again shortly",
+    saleUnavailable = "The stable can't buy horses right now",
+    invalidHorseName = "That name can't be used",
+    notYourHorse = "That horse doesn't belong to you",
+    tradeTooFar = "The other player is too far away",
+    tradeFailed = "The trade could not be completed",
+    stableUnavailable = "The stable is unavailable right now",
+    emptySaddlebags = "Empty the saddlebags before selling this horse",
+    chatSuggestionHorseRespawn = "Reaparecer o seu cavalo se estiver preso",
+    chatSuggestionHorseInfo = "Mostrar informações detalhadas do seu cavalo",
 }

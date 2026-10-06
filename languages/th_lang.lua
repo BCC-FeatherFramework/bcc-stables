@@ -68,15 +68,21 @@ Locales["th_lang"] = {
     horseInfoTrickLvl_4b = "เดินข้าง | space + A หรือ D",
     horseDied = "ม้าของคุณเสียชีวิตแล้ว กลับไปที่คอกม้าเพื่อเลือกม้าใหม่",
     horseWrithe = "Your horse needs help!",
-    -- Discord Alerts
-    discordHorsePurchased = "ซื้อม้าแล้ว!",
-    discordTamedPurchased = "บันทึกม้าที่เชื่องแล้ว!",
-    discordHorseXPGain = "ได้รับ XP ม้า!",
-    discordHorseSold = "ขายม้าแล้ว!",
-    discordTamedSold = "ขายม้าที่เชื่องแล้ว!",
-    discordTraded = "แลกเปลี่ยนม้ากับ ",
     -- Flaming Hooves
     flameHooveDesc = 'An enchanted item to activate flaming hooves',
     flameHoovesActivated = 'Flaming hooves activated!',
     flameHoovesDeactivated = 'Flaming hooves deactivated!',
+    -- Feather Framework
+    moneyUnavailable = "Payments are unavailable right now, try again later",
+    transactionFailed = "The transaction could not be completed",
+    purchasePending = "Your last purchase is still being processed, try again shortly",
+    saleUnavailable = "The stable can't buy horses right now",
+    invalidHorseName = "That name can't be used",
+    notYourHorse = "That horse doesn't belong to you",
+    tradeTooFar = "The other player is too far away",
+    tradeFailed = "The trade could not be completed",
+    stableUnavailable = "The stable is unavailable right now",
+    emptySaddlebags = "Empty the saddlebags before selling this horse",
+    chatSuggestionHorseRespawn = "เรียกม้าใหม่หากม้าติดอยู่",
+    chatSuggestionHorseInfo = "แสดงข้อมูลโดยละเอียดของม้า",
 }

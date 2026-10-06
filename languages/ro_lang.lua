@@ -68,15 +68,21 @@ Locales["ro_lang"] = {
     horseInfoTrickLvl_4b = "Side-Pass | space + A sau D",
     horseDied = "Your horse has died, return to stable to select a horse.",
     horseWrithe = "Your horse needs help!",
-    -- Discord Alerts
-    discordHorsePurchased = "Cal cumpărat!",
-    discordTamedPurchased = "Cal îmblânzit salvat!",
-    discordHorseXPGain = "XP cal câștigat!",
-    discordHorseSold = "Cal vândut!",
-    discordTamedSold = "Cal îmblânzit vândut!",
-    discordTraded = "Cal schimbat cu ",
     -- Flaming Hooves
     flameHooveDesc = 'An enchanted item to activate flaming hooves',
     flameHoovesActivated = 'Flaming hooves activated!',
     flameHoovesDeactivated = 'Flaming hooves deactivated!',
+    -- Feather Framework
+    moneyUnavailable = "Payments are unavailable right now, try again later",
+    transactionFailed = "The transaction could not be completed",
+    purchasePending = "Your last purchase is still being processed, try again shortly",
+    saleUnavailable = "The stable can't buy horses right now",
+    invalidHorseName = "That name can't be used",
+    notYourHorse = "That horse doesn't belong to you",
+    tradeTooFar = "The other player is too far away",
+    tradeFailed = "The trade could not be completed",
+    stableUnavailable = "The stable is unavailable right now",
+    emptySaddlebags = "Empty the saddlebags before selling this horse",
+    chatSuggestionHorseRespawn = "Readu calul dacă s-a blocat",
+    chatSuggestionHorseInfo = "Arată informații detaliate despre cal",
 }

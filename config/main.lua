@@ -7,11 +7,22 @@ Config.defaultlang = 'en_lang'
 Config.devMode = false -- Default: false / Do Not Run on a Live Server
 -----------------------------------------------------
 
-Config.discord = {
-    active = false,
-    webhookURL = '',
-    title = 'BCC-Stables',
-    avatar = ''
+-- Feather Framework integration
+Config.feather = {
+    notifyStyle = 'right',           -- feather-notify style for player messages
+    -- Economy currencies used for 'cash' and 'gold' prices.
+    currencies = {
+        cash = 'dollars',
+        gold = 'gold'
+    },
+    tradeDistance = 5.0,             -- Max distance (meters) between players for a horse trade
+    lootDistance = 4.0,              -- Max distance (meters) between player and horse to open saddlebags
+    nameMaxLength = 30,              -- Max horse name length
+    -- Saddlebags are feather-inventory custom inventories, one per horse.
+    -- Each horse color's invLimit (config/horses.lua) is used as max weight in pounds.
+    saddlebags = {
+        maxSlots = 40                -- nil uses feather-inventory's default slot count
+    }
 }
 -----------------------------------------------------
 
@@ -62,11 +73,13 @@ Config.reviver = 'consumable_horse_reviver'
 -----------------------------------------------------
 
 --- Horse Flaming Hooves
+-- Durability uses feather-inventory item condition, which only works on 'unique'
+-- item definitions. 'diamond' is a stackable valuable, so durability is off by default.
 Config.flamingHooves = {
     active = true,        -- Enable or disable Flaming Hooves
     item = 'diamond',     -- Item Name in Database
     duration = 2,         -- Duration in Minutes for Flaming Hooves Effect
-    durability = true,    -- Enable or disable durability for the flaming hooves item
+    durability = false,   -- Enable or disable durability for the flaming hooves item (needs a unique item)
     maxDurability = 100,  -- Maximum durability for the item
     durabilityPerUse = 5, -- Durability decrease per use
 }
@@ -118,35 +131,12 @@ Config.death             = {
 }
 -----------------------------------------------------
 
--- Horse Inventory
+-- Horse Inventory (feather-inventory saddlebags)
 Config.useSaddlebags = true   -- Default: true / Require Saddlebags for Inventory
 Config.shareInventory = false -- Default: false / Share with All Players / Allows Looting Player Horses
-Config.allowWeapons = true    -- Default: true / Allow Weapons
-Config.whitelistWeapons = false -- Default: false / Set to true to Enable White List for Weapons
-Config.weaponsLimitWhiteList = {
-	-- { name = 'WEAPON_MELEE_TORCH', limit = 1, },
-}
-Config.useBlackList = false -- Default: false / Set to false to Disable
-Config.itemsBlackList = {
+Config.itemsBlackList = {     -- Item names that can never be stored in saddlebags
 	-- 'food_delivery1',
 	-- 'food_delivery2',
-	-- 'food_delivery3',
-}
-Config.ignoreItemStackLimit = true -- Default: true / Set to true to Ignore Item Stack Limit
-Config.useWhiteList = false -- Default: false / Set to true to Enable White List
-Config.itemsLimitWhiteList = {
-	-- { name = 'diamond', limit = 10, },
-}
-Config.usePermissions = false -- Default: false / Set to true to Enable Permissions
-Config.permissions = {
-	allowedJobsTakeFrom = {
-		-- { name = "police", grade = 0 },
-		-- { name = "sheriff", grade = 0 },
-	},
-	allowedJobsMoveTo = {
-		-- { name = "police", grade = 0 },
-		-- { name = "sheriff", grade = 0 },
-	},
 }
 -----------------------------------------------------
 
@@ -177,6 +167,7 @@ Config.tagDistance = 15 -- Default: 15 / Distance from Horse the Tag is Visible
 
 -- Horse Training and Taming
 Config.trainerOnly = false -- Default: false / Only Trainers can Tame and Keep/Sell Wild Horses / Only Trainers can Train Horses
+-- Jobs are feather-jobs job keys; grade is the minimum grade ordinal.
 Config.trainerJob = {
     { name = 'trainer', grade = 0 },
 }
@@ -197,6 +188,8 @@ Config.tamedSellPrice= 0.30     -- Default: 0.30 / Sell Price is 30% of Horse ca
 Config.cooldown = {
     sellTame = 15,              -- Cooldown for Selling Tamed Horses in Minutes
 }
+-- Selling horses pays the player from Economy's currency supply (Issue). Economy
+-- denies this until bcc-stables is granted supply access; see README.
 -----------------------------------------------------
 
 Config.disableKick = false -- Default: false / Disable Kick from Horse

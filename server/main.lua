@@ -1,833 +1,734 @@
-local Core = exports.vorp_core:GetCore()
-local BccUtils = exports['bcc-utils'].initiate()
-local CooldownData = {}
-local DevModeActive = Config.devMode
+-- bcc-stables server: stable purchases, tack, sales, trades, horse state and
+-- saddlebags on the Feather Framework.
+--
+-- Every handler derives the character from the caller's Core session, rechecks
+-- horse ownership with feather-assets, and recomputes prices from config. The
+-- client only says what the player wants to do.
 
-local function DebugPrint(message)
-    if DevModeActive then
-        print('^1[DEV MODE] ^4' .. message)
+StablesCore.ready = false
+local cooldowns = {} -- 'type:characterId' -> os.time()
+
+-- Helpers ------------------------------------------------------------------------
+
+local function HorseConfig(model)
+    if type(model) ~= 'string' then
+        return nil
     end
-end
-
-if Config.discord.active == true then
-    Discord = BccUtils.Discord.setup(Config.discord.webhookURL, Config.discord.title, Config.discord.avatar)
-end
-
-local function LogToDiscord(name, description, embeds)
-    if Config.discord.active == true then
-        Discord:sendMessage(name, description, embeds)
-    end
-end
-
-local function SetPlayerCooldown(type, charid)
-    CooldownData[type .. tostring(charid)] = os.time()
-end
-
-Core.Callback.Register('bcc-stables:BuyHorse', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local charid = character.charIdentifier
-
-    local maxHorses = data.isTrainer and tonumber(Config.maxTrainerHorses) or tonumber(Config.maxPlayerHorses)
-
-    local horseCount = MySQL.query.await('SELECT COUNT(*) as count FROM `player_horses` WHERE `charid` = ? AND `dead` = ?', { charid, 0 })[1].count
-    if horseCount >= maxHorses then
-        Core.NotifyRightTip(src, _U('horseLimit') .. maxHorses .. _U('horses'), 4000)
-        return cb(false)
-    end
-
-    local model = data.ModelH
-    local colorCfg = nil
-
     for _, horseCfg in pairs(Horses) do
-        if horseCfg.colors[model] then
-            colorCfg = horseCfg.colors[model]
-            break
+        local colorCfg = horseCfg.colors[model]
+        if colorCfg then
+            return colorCfg, horseCfg
         end
     end
+    return nil
+end
 
+local function HorseConfigByHash(hash)
+    for _, horseCfg in pairs(Horses) do
+        for model, colorCfg in pairs(horseCfg.colors) do
+            if joaat(model) == hash then
+                return colorCfg, model
+            end
+        end
+    end
+    return nil
+end
+
+local function ValidName(name)
+    if type(name) ~= 'string' then
+        return nil
+    end
+    name = name:match('^%s*(.-)%s*$')
+    if #name < 1 or #name > Config.feather.nameMaxLength or name:find('%c') or name:find('[<>]') then
+        return nil
+    end
+    return name
+end
+
+local function Gender(value)
+    return value == 'female' and 'female' or 'male'
+end
+
+local function IsTrainer(character)
+    return StablesJobs.HasAny(character.characterId, Config.trainerJob)
+end
+
+-- The caller's active character, or nil while the stable is unavailable.
+local function Begin(src)
+    if not StablesCore.ready then
+        return nil
+    end
+    return StablesCharacters.Get(src)
+end
+
+local function NearStable(src, site)
+    local siteCfg = Stables[site]
+    if not siteCfg then
+        return false
+    end
+    local coords = GetEntityCoords(GetPlayerPed(src))
+    return #(coords - siteCfg.npc.coords) <= siteCfg.shop.distance + 5.0
+end
+
+local function NearTrainer(src)
+    local coords = GetEntityCoords(GetPlayerPed(src))
+    for _, siteCfg in pairs(Trainers) do
+        if #(coords - siteCfg.npc.coords) <= siteCfg.shop.distance + 5.0 then
+            return true
+        end
+    end
+    return false
+end
+
+-- The horse entity the client named, when it exists next to the player.
+local function NearEntity(src, netId, distance)
+    local entity = NetworkGetEntityFromNetworkId(tonumber(netId) or 0)
+    if entity == 0 or not DoesEntityExist(entity)
+        or #(GetEntityCoords(GetPlayerPed(src)) - GetEntityCoords(entity)) > distance then
+        return nil
+    end
+    return entity
+end
+
+local function OwnedCount(character)
+    local owned = StablesAssets.ListOwned(character.characterId)
+    if not owned.ok then
+        return nil
+    end
+    return #owned.value
+end
+
+-- Shared purchase rules: horse limit, then a wallet balance preflight.
+local function CanAfford(character, currency, amount)
+    if amount <= 0 then
+        return true
+    end
+    local wallet = StablesEconomy.GetWallet(character.characterId, currency)
+    if not wallet.ok then
+        NotifyClient(character.source, StablesEconomy.Message(wallet, currency))
+        return false
+    end
+    if (tonumber(wallet.value.balance) or 0) < amount then
+        NotifyClient(character.source, StablesEconomy.Message({ code = 'insufficient_funds' }, currency))
+        return false
+    end
+    return true
+end
+
+local function WithinLimit(character, trainer)
+    local maxHorses = trainer and tonumber(Config.maxTrainerHorses) or tonumber(Config.maxPlayerHorses)
+    local count = OwnedCount(character)
+    if not count then
+        NotifyClient(character.source, _U('stableUnavailable'))
+        return false
+    end
+    if count >= maxHorses then
+        NotifyClient(character.source, _U('horseLimit') .. maxHorses .. _U('horses'))
+        return false
+    end
+    return true
+end
+
+-- Validates a stable purchase and returns its order payload, or nil.
+local function PurchasePayload(character, data)
+    local site = data.site
+    if not NearStable(character.source, site) then
+        return nil
+    end
+    local colorCfg = HorseConfig(data.ModelH)
     if not colorCfg then
-        print('Horse model not found in the configuration')
-        return cb(false)
+        return nil
     end
-
-    if data.IsCash then
-        if character.money >= colorCfg.cashPrice then
-            cb(true)
-        else
-            Core.NotifyRightTip(src, _U('shortCash'), 4000)
-            cb(false)
+    local siteCfg = Stables[site]
+    local trainer = IsTrainer(character)
+    if siteCfg.trainerBuy and not trainer then
+        NotifyClient(character.source, _U('trainerBuyHorse'))
+        return nil
+    end
+    if siteCfg.shop.jobsEnabled and not StablesJobs.HasAny(character.characterId, siteCfg.shop.jobs) then
+        NotifyClient(character.source, _U('needJob'))
+        return nil
+    end
+    if colorCfg.job and #colorCfg.job > 0 then
+        local jobs = {}
+        for _, jobKey in ipairs(colorCfg.job) do
+            jobs[#jobs + 1] = { name = jobKey, grade = 0 }
         end
+        if not StablesJobs.HasAny(character.characterId, jobs) then
+            NotifyClient(character.source, _U('needJob'))
+            return nil
+        end
+    end
+    if not WithinLimit(character, trainer) then
+        return nil
+    end
+    local kind = data.IsCash and 'cash' or 'gold'
+    if (kind == 'cash' and Config.currencyType == 1) or (kind == 'gold' and Config.currencyType == 0) then
+        return nil
+    end
+    local currency = StablesEconomy.Currency(kind)
+    local amount = StablesEconomy.ToMinor(currency, kind == 'cash' and colorCfg.cashPrice or colorCfg.goldPrice)
+    if not amount.ok then
+        NotifyClient(character.source, _U('moneyUnavailable'))
+        return nil
+    end
+    if not CanAfford(character, currency, amount.value) then
+        return nil
+    end
+    return {
+        model = data.ModelH,
+        currency = currency,
+        amount = amount.value,
+        captured = false,
+        provenanceType = 'stable_purchase',
+        reasonCode = 'stables.purchase'
+    }
+end
+
+-- Validates registering a tamed horse and returns its order payload, or nil.
+local function TamePayload(character, data)
+    if not Config.allowKeep or not HorseConfig(data.ModelH) or not NearTrainer(character.source) then
+        return nil
+    end
+    local trainer = IsTrainer(character)
+    if Config.trainerOnly and not trainer then
+        NotifyClient(character.source, _U('trainerRegHorse'))
+        return nil
+    end
+    if not WithinLimit(character, trainer) then
+        return nil
+    end
+    local currency = StablesEconomy.Currency('cash')
+    local amount = StablesEconomy.ToMinor(currency, Config.regCost)
+    if not amount.ok then
+        NotifyClient(character.source, _U('moneyUnavailable'))
+        return nil
+    end
+    if not CanAfford(character, currency, amount.value) then
+        return nil
+    end
+    return {
+        model = data.ModelH,
+        currency = currency,
+        amount = amount.value,
+        captured = true,
+        provenanceType = 'tamed_capture',
+        reasonCode = 'stables.tame_register'
+    }
+end
+
+local function NotifyOrderFailure(src, result, currency)
+    if result.code == 'order_pending' then
+        NotifyClient(src, _U('purchasePending'))
     else
-        if character.gold >= colorCfg.goldPrice then
-            cb(true)
-        else
-            Core.NotifyRightTip(src, _U('shortGold'), 4000)
-            cb(false)
-        end
+        NotifyClient(src, StablesEconomy.Message(result, currency))
     end
+end
+
+-- Owned horse or a notification, for the per-horse handlers.
+local function OwnedHorse(character, horseId)
+    local asset = StablesAssets.GetOwned(horseId, character.characterId)
+    if not asset.ok then
+        if asset.code == 'not_owner' then
+            NotifyClient(character.source, _U('notYourHorse'))
+        end
+        return nil
+    end
+    return asset.value
+end
+
+-- Shop and purchases ---------------------------------------------------------------
+
+StablesRPC.Register('bcc-stables:GetMyHorses', function(_, src)
+    local character = Begin(src)
+    if not character then
+        NotifyClient(src, _U('stableUnavailable'))
+        return false
+    end
+    StablesOrders.Resume(character)
+    local horses = StablesHorses.ListForClient(character.characterId)
+    if not horses.ok then
+        NotifyClient(src, _U('stableUnavailable'))
+        return false
+    end
+    return horses.value
 end)
 
-Core.Callback.Register('bcc-stables:RegisterHorse', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local charid = character.charIdentifier
-
-    local maxHorses = data.isTrainer and tonumber(Config.maxTrainerHorses) or tonumber(Config.maxPlayerHorses)
-
-    local horseCount = MySQL.query.await('SELECT COUNT(*) as count FROM `player_horses` WHERE `charid` = ? AND `dead` = ?', { charid, 0 })[1].count
-    if horseCount >= maxHorses then
-        Core.NotifyRightTip(src, _U('horseLimit') .. maxHorses .. _U('horses'), 4000)
-        return cb(false)
-    end
-
-    if data.IsCash and data.origin == 'tameHorse' then
-        if character.money >= Config.regCost then
-            return cb(true)
-        else
-            Core.NotifyRightTip(src, _U('shortCash'), 4000)
-            return cb(false)
-        end
-    end
-
-    cb(false)
+-- Preflight before the naming keyboard opens; the order itself rechecks everything.
+StablesRPC.Register('bcc-stables:BuyHorse', function(data, src)
+    local character = Begin(src)
+    return character ~= nil and PurchasePayload(character, data) ~= nil
 end)
 
-Core.Callback.Register('bcc-stables:BuyTack', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
+StablesRPC.Register('bcc-stables:SaveNewHorse', function(data, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    local name = ValidName(data.name)
+    if not name then
+        NotifyClient(src, _U('invalidHorseName'))
+        return false
+    end
+    local payload = PurchasePayload(character, data)
+    if not payload then
+        return false
+    end
+    payload.name = name
+    payload.gender = Gender(data.gender)
+    local result = StablesOrders.Run(character, 'purchase', payload)
+    if not result.ok then
+        NotifyOrderFailure(src, result, payload.currency)
+        return false
+    end
+    NotifyClient(src, _U('purchaseSuccessful'))
+    return true
+end)
 
-    local character = user.getUsedCharacter
-    local cashPrice = tonumber(data.cashPrice)
-    local goldPrice = tonumber(data.goldPrice)
+StablesRPC.Register('bcc-stables:RegisterHorse', function(data, src)
+    local character = Begin(src)
+    return character ~= nil and TamePayload(character, data) ~= nil
+end)
 
-    if cashPrice > 0 and goldPrice > 0 then
-        if tonumber(data.currencyType) == 0 then
-            if character.money >= cashPrice then
-                character.removeCurrency(0, cashPrice)
-            else
-                Core.NotifyRightTip(src, _U('shortCash'), 4000)
-                return cb(false)
+StablesRPC.Register('bcc-stables:SaveTamedHorse', function(data, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    local name = ValidName(data.name)
+    if not name then
+        NotifyClient(src, _U('invalidHorseName'))
+        return false
+    end
+    local payload = TamePayload(character, data)
+    if not payload then
+        return false
+    end
+    payload.name = name
+    payload.gender = Gender(data.gender)
+    local result = StablesOrders.Run(character, 'tame_register', payload)
+    if not result.ok then
+        NotifyOrderFailure(src, result, payload.currency)
+        return false
+    end
+    return true
+end)
+
+-- Tack: the server prices every component the horse does not already wear,
+-- charges once, then saves the components to the horse's Assets metadata.
+StablesRPC.Register('bcc-stables:SaveTack', function(data, src)
+    local character = Begin(src)
+    if not character or type(data.components) ~= 'table' then
+        return false
+    end
+    local horse = OwnedHorse(character, data.horseId)
+    if not horse then
+        return false
+    end
+    local owned = {}
+    for _, hash in ipairs((horse.metadata or {}).components or {}) do
+        owned[tostring(hash):upper()] = true
+    end
+    local catalog = {}
+    for _, category in pairs(HorseComp) do
+        for _, comp in ipairs(category) do
+            catalog[comp.hash:upper()] = comp
+        end
+    end
+    local components, cash, gold = {}, 0, 0
+    for index = 1, math.min(#data.components, 32) do
+        local hash = data.components[index]
+        if type(hash) == 'string' and catalog[hash:upper()] then
+            components[#components + 1] = catalog[hash:upper()].hash
+            if not owned[hash:upper()] then
+                cash = cash + (tonumber(catalog[hash:upper()].cashPrice) or 0)
+                gold = gold + (tonumber(catalog[hash:upper()].goldPrice) or 0)
             end
-        else
-            if character.gold >= goldPrice then
-                character.removeCurrency(1, goldPrice)
-            else
-                Core.NotifyRightTip(src, _U('shortGold'), 4000)
-                return cb(false)
-            end
-        end
-        Core.NotifyRightTip(src, _U('purchaseSuccessful'), 4000)
-        return cb(true)
-    end
-
-    cb(false)
-end)
-
-Core.Callback.Register('bcc-stables:SaveNewHorse', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local name = data.name
-    local model = data.ModelH
-    local gender = data.gender
-    local captured = data.captured
-    local isCash = data.IsCash
-    local currencyType = isCash and 0 or 1
-    local priceKey = isCash and 'cashPrice' or 'goldPrice'
-    local currency = isCash and character.money or character.gold
-    local notification = isCash and _U('shortCash') or _U('shortGold')
-
-    for _, horseCfg in pairs(Horses) do
-        local colorCfg = horseCfg.colors[model]
-        if colorCfg then
-            if currency >= colorCfg[priceKey] then
-                character.removeCurrency(currencyType, colorCfg[priceKey])
-
-                MySQL.query.await('INSERT INTO `player_horses` (identifier, charid, name, model, gender, captured) VALUES (?, ?, ?, ?, ?, ?)',
-                { identifier, charid, name, model, gender, captured })
-
-                LogToDiscord(charid, _U('discordHorsePurchased'))
-                return cb(true)
-            else
-                Core.NotifyRightTip(src, notification, 4000)
-                return cb(false)
-            end
         end
     end
-
-    cb(false)
-end)
-
-Core.Callback.Register('bcc-stables:SaveTamedHorse', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local regCost = Config.regCost
-    local name = data.name
-    local model = data.ModelH
-    local gender = data.gender
-    local captured = data.captured
-
-    if data.IsCash and data.origin == 'tameHorse' then
-        if character.money < regCost then
-            Core.NotifyRightTip(src, _U('shortCash'), 4000)
-            return cb(false)
-        end
-        character.removeCurrency(0, regCost)
+    local kind = tonumber(data.currencyType) == 1 and 'gold' or 'cash'
+    local currency = StablesEconomy.Currency(kind)
+    local amount = StablesEconomy.ToMinor(currency, kind == 'gold' and gold or cash)
+    if not amount.ok or not CanAfford(character, currency, amount.value) then
+        return false
     end
-
-    MySQL.query.await('INSERT INTO `player_horses` (identifier, charid, name, model, gender, captured) VALUES (?, ?, ?, ?, ?, ?)',
-    { identifier, charid, name, model, gender, captured })
-
-    LogToDiscord(charid, _U('discordTamedPurchased'))
-    cb(true)
-end)
-
-Core.Callback.Register('bcc-stables:UpdateHorseName', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local newName = data.name
-    local horseId = data.horseId
-
-    MySQL.query.await('UPDATE `player_horses` SET `name` = ? WHERE `id` = ? AND `identifier` = ? AND `charid` = ?',
-    { newName, horseId, identifier, charid })
-
-    cb(true)
-end)
-
-RegisterNetEvent('bcc-stables:UpdateHorseXp', function(Xp, horseId)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-
-    MySQL.query.await('UPDATE `player_horses` SET `xp` = ? WHERE `id` = ? AND `identifier` = ? AND `charid` = ?',
-    { Xp, horseId, identifier, charid })
-
-    LogToDiscord(charid, _U('discordHorseXPGain'))
-end)
-
-RegisterNetEvent('bcc-stables:SaveHorseStatsToDb', function(health, stamina, id)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local horseHealth = tonumber(health) or 100
-    local horseStamina = tonumber(stamina) or 100
-    local horseId = tonumber(id)
-
-    print("Saving horse stats to DB:", horseId, horseHealth, horseStamina)
-    MySQL.query.await('UPDATE `player_horses` SET `health` = ?, `stamina` = ? WHERE id = ? AND `identifier` = ? AND `charid` = ?',
-    { horseHealth, horseStamina, horseId, identifier, charid })
-end)
-
-RegisterNetEvent('bcc-stables:SelectHorse', function(data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local selectedHorseId = data.horseId
-
-    -- Deselect all horses for the character
-    MySQL.query.await('UPDATE `player_horses` SET `selected` = ? WHERE `charid` = ? AND `identifier` = ? AND `dead` = ?',
-    { 0, charid, identifier, 0 })
-
-    -- Select the specified horse
-    MySQL.query.await('UPDATE `player_horses` SET `selected` = ? WHERE `id` = ? AND `charid` = ? AND `identifier` = ?',
-    { 1, selectedHorseId, charid, identifier })
-end)
-
-RegisterNetEvent('bcc-stables:SetHorseWrithe', function(horseId)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-
-    MySQL.query.await('UPDATE `player_horses` SET `writhe` = ? WHERE `id` = ? AND `identifier` = ? AND `charid` = ?',
-    { 1, horseId, identifier, charid })
-end)
-
--- Update Horse Selected and Dead Status After Death Event
-RegisterNetEvent('bcc-stables:UpdateHorseStatus', function(horseId, action)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-
-    local selected = (action == 'dead' or action == 'deselect') and 0 or 1
-    local dead = action == 'dead' and 1 or 0
-
-    MySQL.query.await('UPDATE `player_horses` SET `selected` = ?, `writhe` = ?, `dead` = ? WHERE `id` = ? AND `identifier` = ? AND `charid` = ?',
-    { selected, 0, dead, horseId, identifier, charid })
-end)
-
-Core.Callback.Register('bcc-stables:GetHorseData', function(source, cb)
-    local src = source
-    local user = Core.getUser(src)
-
-    if not user then
-        DebugPrint('User not found for source: ' .. tostring(src))
-        return cb(false)
-    end
-
-    local character = user.getUsedCharacter
-
-    local horses = MySQL.query.await('SELECT * FROM `player_horses` WHERE `charid` = ? AND `identifier` = ? AND `dead` = ?',
-    { character.charIdentifier, character.identifier, 0 })
-
-    if #horses == 0 then
-        Core.NotifyRightTip(src, _U('noHorses'), 4000)
-        return cb(false)
-    end
-
-    local selectedHorse = nil
-    for _, horse in ipairs(horses) do
-        if horse.selected == 1 then
-            selectedHorse = horse
-            break
-        end
-    end
-
-    if not selectedHorse then
-        Core.NotifyRightTip(src, _U('noSelectedHorse'), 4000)
-        return cb(false)
-    end
-
-    cb({
-        model = selectedHorse.model,
-        name = selectedHorse.name,
-        components = selectedHorse.components,
-        id = selectedHorse.id,
-        gender = selectedHorse.gender,
-        xp = selectedHorse.xp,
-        captured = selectedHorse.captured,
-        health = selectedHorse.health,
-        stamina = selectedHorse.stamina,
-        writhe = selectedHorse.writhe
+    local result = StablesOrders.Run(character, 'tack', {
+        assetId = horse.assetId,
+        components = components,
+        currency = currency,
+        amount = amount.value,
+        reasonCode = 'stables.tack'
     })
-end)
-
-Core.Callback.Register('bcc-stables:GetMyHorses', function(source, cb)
-    local src = source
-    local user = Core.getUser(src)
-
-    -- Check if the user exists
-    if not user then
-        DebugPrint('User not found for source: ' .. tostring(src))
-        return cb(false)
+    if not result.ok then
+        NotifyOrderFailure(src, result, currency)
+        return false
     end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-
-    local horses = MySQL.query.await('SELECT * FROM `player_horses` WHERE `charid` = ? AND `identifier` = ? AND `dead` = ?', { charid, identifier, 0 })
-
-    cb(horses)
-end)
-
-Core.Callback.Register('bcc-stables:UpdateComponents', function(source, cb, encodedComponents, horseId)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-
-    MySQL.query.await('UPDATE `player_horses` SET `components` = ? WHERE `id` = ? AND `charid` = ? AND `identifier` = ?',
-    { encodedComponents, horseId, charid, identifier })
-
-    cb(true)
-end)
-
-Core.Callback.Register('bcc-stables:SellMyHorse', function(source, cb, data)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local identifier = character.identifier
-    local charid = character.charIdentifier
-    local model = nil
-    local horseId = tonumber(data.horseId)
-    local captured = data.captured
-    local matchFound = false
-
-    -- Fetch the horse data
-    local horses = MySQL.query.await('SELECT `id`, `model` FROM `player_horses` WHERE `charid` = ? AND `identifier` = ? AND `dead` = ?',
-    { charid, identifier, 0 })
-
-    -- Find the horse and delete it
-    for i = 1, #horses do
-        if tonumber(horses[i].id) == horseId then
-            matchFound = true
-            model = horses[i].model
-
-            MySQL.query.await('DELETE FROM `player_horses` WHERE `id` = ? AND `charid` = ? AND `identifier` = ?',
-            { horseId, charid, identifier })
-
-            LogToDiscord(charid, _U('discordHorseSold'))
-            break
-        end
+    if amount.value > 0 then
+        NotifyClient(src, _U('purchaseSuccessful'))
     end
+    return true
+end)
 
-    if not matchFound then return cb(false) end
-
-    -- Determine the sell price
-    for _, horseCfg in pairs(Horses) do
-        local colorCfg = horseCfg.colors[model]
-        if colorCfg then
-            local sellPrice = captured and (Config.tamedSellPrice * colorCfg.cashPrice) or (Config.sellPrice * colorCfg.cashPrice)
-            character.addCurrency(0, sellPrice)
-            Core.NotifyRightTip(src, _U('soldHorse') .. sellPrice, 4000)
-            return cb(true)
-        end
+StablesRPC.Register('bcc-stables:UpdateHorseName', function(data, src)
+    local character = Begin(src)
+    if not character then
+        return false
     end
-
-    cb(false)
-end)
-
-RegisterNetEvent('bcc-stables:SellTamedHorse', function(hash)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local character = user.getUsedCharacter
-    local charid = character.charIdentifier
-    local sellPriceMultiplier = Config.tamedSellPrice
-
-    for _, horseCfg in pairs(Horses) do
-        for color, colorCfg in pairs(horseCfg.colors) do
-            local colorHash = joaat(color)
-            if colorHash == hash then
-                local sellPrice = (sellPriceMultiplier * colorCfg.cashPrice)
-                character.addCurrency(0, math.ceil(sellPrice))
-                Core.NotifyRightTip(src, _U('soldHorse') .. sellPrice, 4000)
-                SetPlayerCooldown('sellTame', charid)
-                LogToDiscord(charid, _U('discordTamedSold'))
-                return
-            end
-        end
+    local name = ValidName(data.name)
+    if not name then
+        NotifyClient(src, _U('invalidHorseName'))
+        return false
     end
-end)
-
-RegisterNetEvent('bcc-stables:SaveHorseTrade', function(serverId, horseId)
-    -- Current Owner
-    local src = source
-    local curUser = Core.getUser(src)
-    if not curUser then return end
-
-    local curOwner = curUser.getUsedCharacter
-    local curOwnerId = curOwner.identifier
-    local curOwnerCharId = curOwner.charIdentifier
-    local curOwnerName = curOwner.firstname .. " " .. curOwner.lastname
-    -- New Owner
-    local newUser = Core.getUser(serverId)
-    if not newUser then return end
-
-    local newOwner = newUser.getUsedCharacter
-    local newOwnerId = newOwner.identifier
-    local newOwnerCharId = newOwner.charIdentifier
-    local newOwnerName = newOwner.firstname .. " " .. newOwner.lastname
-
-    -- Fetch the horse
-    local horse = MySQL.query.await('SELECT * FROM `player_horses` WHERE `id` = ? AND `charid` = ? AND `identifier` = ? AND `dead` = ?',
-    { horseId, curOwnerCharId, curOwnerId, 0 })
-
-    if horse and #horse > 0 then
-        -- Update the horse ownership
-        MySQL.query.await('UPDATE `player_horses` SET `identifier` = ?, `charid` = ?, `selected` = ? WHERE `id` = ?',
-        { newOwnerId, newOwnerCharId, 0, horseId })
-
-        -- Notify both parties
-        Core.NotifyRightTip(src, _U('youGave') .. newOwnerName .. _U('aHorse'), 4000)
-        Core.NotifyRightTip(serverId, curOwnerName .._U('gaveHorse'), 4000)
-
-        LogToDiscord(curOwnerName, _U('discordTraded') .. newOwnerName)
+    local horse = OwnedHorse(character, data.horseId)
+    if not horse then
+        return false
     end
-end)
-
-RegisterNetEvent('bcc-stables:RegisterInventory', function(id, model)
-    local idStr = 'horse_' .. tostring(id)
-    local isRegistered = exports.vorp_inventory:isCustomInventoryRegistered(idStr)
-
-    for _, horseCfg in pairs(Horses) do
-        if horseCfg.colors[model] then
-            local colorCfg = horseCfg.colors[model]
-            local data = {
-                id = idStr,
-                name = _U('horseInv'),
-                limit = tonumber(colorCfg.invLimit),
-                acceptWeapons = Config.allowWeapons,
-                shared = Config.shareInventory,
-                ignoreItemStackLimit = Config.ignoreItemStackLimit or true,
-                whitelistItems =  Config.useWhiteList or false,
-                UsePermissions = Config.usePermissions or false,
-                UseBlackList = Config.useBlackList or false,
-                whitelistWeapons = Config.whitelistWeapons or false
-            }
-
-            if isRegistered then
-                exports.vorp_inventory:updateCustomInventoryData(idStr, data)
-            else
-                exports.vorp_inventory:registerInventory(data)
-            end
-
-            if data.UsePermissions then
-                for _, permission in ipairs(Config.permissions.allowedJobsTakeFrom) do
-                    exports.vorp_inventory:AddPermissionTakeFromCustom(idStr, permission.name, permission.grade)
-                end
-                for _, permission in ipairs(Config.permissions.allowedJobsMoveTo) do
-                    exports.vorp_inventory:AddPermissionMoveToCustom(idStr, permission.name, permission.grade)
-                end
-            end
-
-            if data.whitelistItems then
-                for _, item in ipairs(Config.itemsLimitWhiteList) do
-                    exports.vorp_inventory:setCustomInventoryItemLimit(idStr, item.name, item.limit)
-                end
-            end
-
-            if data.whitelistWeapons then
-                for _, weapon in ipairs(Config.weaponsLimitWhiteList) do
-                    exports.vorp_inventory:setCustomInventoryWeaponLimit(idStr, weapon.name, weapon.limit)
-                end
-            end
-
-            if data.UseBlackList then
-                for _, item in ipairs(Config.itemsBlackList) do
-                    exports.vorp_inventory:BlackListCustomAny(idStr, item)
-                end
-            end
-            break
-        end
+    local metadata = horse.metadata or {}
+    metadata.name = name
+    local updated = StablesAssets.UpdateMetadata('rename:' .. StablesCore.NewId(), horse.assetId,
+        metadata, character, 'stables.rename')
+    if not updated.ok then
+        NotifyClient(src, _U('transactionFailed'))
+        return false
     end
+    return true
 end)
 
-RegisterNetEvent('bcc-stables:OpenInventory', function(id)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
+-- Sales --------------------------------------------------------------------------
 
-    local idStr = 'horse_' .. tostring(id)
-    exports.vorp_inventory:openInventory(src, idStr)
-end)
-
--- Iterate over each item in the Config.horseFood array to register them as usable items
-for _, item in ipairs(Config.horseFood) do
-    exports.vorp_inventory:registerUsableItem(item, function(data)
-        local src = data.source
-        exports.vorp_inventory:closeInventory(src)
-
-        TriggerClientEvent('bcc-stables:FeedHorse', src, item)
-    end)
-end
-
-if Config.flamingHooves.active then
-    exports.vorp_inventory:registerUsableItem(Config.flamingHooves.item, function(data)
-        local src = data.source
-        local user = Core.getUser(src)
-        if not user then return end
-
-        local item = exports.vorp_inventory:getItem(src, Config.flamingHooves.item)
-        exports.vorp_inventory:closeInventory(src)
-
-        if Config.flamingHooves.durability then
-            local maxDurability = Config.flamingHooves.maxDurability or 100
-            local useDurability = Config.flamingHooves.durabilityPerUse or 1
-            local itemMetadata = item.metadata
-            local currentDurability = itemMetadata.durability
-
-            -- Initialize durability if it doesn't exist
-            if not currentDurability then
-                currentDurability = maxDurability
-                local newData = {
-                    description = _U('flameHooveDesc') .. '</br>' .. _U('durability') .. currentDurability .. '%',
-                    durability = currentDurability,
-                    id = item.id
-                }
-                exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
-            end
-
-            -- Check if durability is below the usage threshold
-            if currentDurability < useDurability then
-                exports.vorp_inventory:subItemID(src, item.id)
-                Core.NotifyRightTip(src, _U('itemBroke'), 4000)
-                return
-            end
-        end
-
-        TriggerClientEvent('bcc-stables:FlamingHooves', src)
-    end)
-
-    RegisterNetEvent('bcc-stables:FlamingHoovesDurability', function()
-        local src = source
-        local user = Core.getUser(src)
-        if not user then return end
-
-        local item = exports.vorp_inventory:getItem(src, Config.flamingHooves.item)
-        local useDurability = Config.flamingHooves.durabilityPerUse or 1
-        local itemMetadata = item.metadata
-        local newDurability = itemMetadata.durability - useDurability
-
-        -- Check if durability is below the usage threshold or update the durability
-        if newDurability < useDurability then
-            exports.vorp_inventory:subItemID(src, item.id)
-            Core.NotifyRightTip(src, _U('itemBroke'), 4000)
+StablesRPC.Register('bcc-stables:SellMyHorse', function(data, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    if not NearStable(src, data.site) then
+        return false
+    end
+    local horse = OwnedHorse(character, data.horseId)
+    if not horse then
+        return false
+    end
+    local colorCfg = HorseConfig(horse.modelKey)
+    if not colorCfg then
+        return false
+    end
+    local empty = StablesInventory.IsEmpty(horse.assetId)
+    if not empty.ok or not empty.value then
+        NotifyClient(src, _U('emptySaddlebags'))
+        return false
+    end
+    local row = StablesHorses.Row(horse.assetId) or {}
+    local multiplier = tonumber(row.captured) == 1 and Config.tamedSellPrice or Config.sellPrice
+    local currency = StablesEconomy.Currency('cash')
+    local amount = StablesEconomy.ToMinor(currency, multiplier * colorCfg.cashPrice)
+    if not amount.ok then
+        return false
+    end
+    local result = StablesOrders.Run(character, 'sale', {
+        assetId = horse.assetId,
+        currency = currency,
+        amount = amount.value,
+        reasonCode = 'stables.horse_sale'
+    })
+    if not result.ok then
+        if result.code == 'authorization_denied' then
+            NotifyClient(src, _U('saleUnavailable'))
         else
-            local newData = {
-                description = _U('flameHooveDesc') .. '</br>' .. _U('durability') .. newDurability .. '%',
-                durability = newDurability,
-                id = item.id
-            }
-            exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
+            NotifyOrderFailure(src, result, currency)
         end
-    end)
-end
-
-RegisterNetEvent('bcc-stables:RemoveItem', function(item)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    exports.vorp_inventory:subItem(src, item, 1)
-end)
-
-exports.vorp_inventory:registerUsableItem(Config.horsebrush.item, function(data)
-    local src = data.source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local item = exports.vorp_inventory:getItem(src, Config.horsebrush.item)
-    exports.vorp_inventory:closeInventory(src)
-
-    if Config.horsebrush.durability then
-        local maxDurability = Config.horsebrush.maxDurability or 100
-        local useDurability = Config.horsebrush.durabilityPerUse or 1
-        local itemMetadata = item.metadata
-        local currentDurability = itemMetadata.durability
-
-        -- Initialize durability if it doesn't exist
-        if not currentDurability then
-            currentDurability = maxDurability
-            local newData = {
-                description = _U('horsebrushDesc') .. '</br>' .. _U('durability') .. currentDurability .. '%',
-                durability = currentDurability,
-                id = item.id
-            }
-            exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
-        end
-
-        -- Check if durability is below the usage threshold
-        if currentDurability < useDurability then
-            exports.vorp_inventory:subItemID(src, item.id)
-            Core.NotifyRightTip(src, _U('itemBroke'), 4000)
-            return
-        end
+        return false
     end
-
-    TriggerClientEvent('bcc-stables:BrushHorse', src)
+    NotifyClient(src, _U('soldHorse') .. StablesEconomy.FormatMinor(currency, amount.value))
+    return true
 end)
 
-RegisterNetEvent('bcc-stables:HorseBrushDurability', function()
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local item = exports.vorp_inventory:getItem(src, Config.horsebrush.item)
-    local useDurability = Config.horsebrush.durabilityPerUse or 1
-    local itemMetadata = item.metadata
-    local newDurability = itemMetadata.durability - useDurability
-
-    -- Check if durability is below the usage threshold or update the durability
-    if newDurability < useDurability then
-        exports.vorp_inventory:subItemID(src, item.id)
-        Core.NotifyRightTip(src, _U('itemBroke'), 4000)
-    else
-        local newData = {
-            description = _U('horsebrushDesc') .. '</br>' .. _U('durability') .. newDurability .. '%',
-            durability = newDurability,
-            id = item.id
-        }
-        exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
+StablesRPC.Register('bcc-stables:SellTamedHorse', function(data, src)
+    local character = Begin(src)
+    if not character or not Config.allowSale or not NearTrainer(src) then
+        return false
     end
-end)
-
-exports.vorp_inventory:registerUsableItem(Config.lantern.item, function(data)
-    local src = data.source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local item = exports.vorp_inventory:getItem(src, Config.lantern.item)
-    exports.vorp_inventory:closeInventory(src)
-
-    if Config.lantern.durability then
-        local maxDurability = Config.lantern.maxDurability or 100
-        local useDurability = Config.lantern.durabilityPerUse or 1
-        local itemMetadata = item.metadata
-        local currentDurability = itemMetadata.durability
-
-        -- Initialize durability if it doesn't exist
-        if not currentDurability then
-            currentDurability = maxDurability
-            local newData = {
-                description = _U('lanternDesc') .. '</br>' .. _U('durability') .. currentDurability .. '%',
-                durability = currentDurability,
-                id = item.id
-            }
-            exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
-        end
-
-        -- Check if durability is below the usage threshold
-        if currentDurability < useDurability then
-            exports.vorp_inventory:subItemID(src, item.id)
-            Core.NotifyRightTip(src, _U('itemBroke'), 4000)
-            return
-        end
+    local key = 'sellTame:' .. character.characterId
+    if cooldowns[key] and os.difftime(os.time(), cooldowns[key]) < Config.cooldown.sellTame * 60 then
+        NotifyClient(src, _U('sellCooldown'))
+        return false
     end
-
-    TriggerClientEvent('bcc-stables:UseLantern', src)
-end)
-
-RegisterNetEvent('bcc-stables:LanternDurability', function()
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
-
-    local item = exports.vorp_inventory:getItem(src, Config.lantern.item)
-    local useDurability = Config.lantern.durabilityPerUse or 1
-    local itemMetadata = item.metadata
-    local newDurability = itemMetadata.durability - useDurability
-
-    -- Check if durability is below the usage threshold or update the durability
-    if newDurability < useDurability then
-        exports.vorp_inventory:subItemID(src, item.id)
-        Core.NotifyRightTip(src, _U('itemBroke'), 4000)
-    else
-        local newData = {
-            description = _U('lanternDesc') .. '</br>' .. _U('durability') .. newDurability .. '%',
-            durability = newDurability,
-            id = item.id
-        }
-        exports.vorp_inventory:setItemMetadata(src, item.id, newData, 1)
+    if Config.trainerOnly and not IsTrainer(character) then
+        NotifyClient(src, _U('trainerSellHorse'))
+        return false
     end
-end)
-
-Core.Callback.Register('bcc-stables:HorseReviveItem', function(source, cb)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local reviveItem = Config.reviver
-    local hasItem = exports.vorp_inventory:getItem(src, reviveItem)
-
-    if not hasItem then
-        return cb(false)
+    local colorCfg = HorseConfigByHash(tonumber(data.hash))
+    if not colorCfg then
+        return false
     end
-
-    exports.vorp_inventory:subItem(src, reviveItem, 1)
-    cb(true)
-end)
-
-Core.Callback.Register('bcc-stables:CheckPlayerCooldown', function(source, cb, type)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local cooldown = Config.cooldown[type]
-    local typeId = type .. tostring(character.charIdentifier)
-    local currentTime = os.time()
-    local lastTime = CooldownData[typeId]
-
-    if lastTime then
-        if os.difftime(currentTime, lastTime) >= cooldown * 60 then
-            cb(false) -- Not on Cooldown
+    local currency = StablesEconomy.Currency('cash')
+    local amount = StablesEconomy.ToMinor(currency, math.ceil(Config.tamedSellPrice * colorCfg.cashPrice))
+    if not amount.ok then
+        return false
+    end
+    local result = StablesOrders.Run(character, 'tamed_sale', {
+        currency = currency,
+        amount = amount.value,
+        reasonCode = 'stables.tamed_sale'
+    })
+    if not result.ok then
+        if result.code == 'authorization_denied' then
+            NotifyClient(src, _U('saleUnavailable'))
         else
-            cb(true) -- On Cooldown
+            NotifyOrderFailure(src, result, currency)
         end
+        return false
+    end
+    cooldowns[key] = os.time()
+    NotifyClient(src, _U('soldHorse') .. StablesEconomy.FormatMinor(currency, amount.value))
+    return true
+end)
+
+StablesRPC.Register('bcc-stables:CheckPlayerCooldown', function(data, src)
+    local character = Begin(src)
+    local cooldown = Config.cooldown[data.type]
+    if not character or not cooldown then
+        return false
+    end
+    local last = cooldowns[tostring(data.type) .. ':' .. character.characterId]
+    return last ~= nil and os.difftime(os.time(), last) < cooldown * 60
+end)
+
+-- Trade ------------------------------------------------------------------------
+
+StablesRPC.Register('bcc-stables:SaveHorseTrade', function(data, src)
+    local character = Begin(src)
+    local target = StablesCharacters.Get(tonumber(data.serverId))
+    if not character or not target or target.characterId == character.characterId then
+        NotifyClient(src, _U('tradeFailed'))
+        return false
+    end
+    local distance = #(GetEntityCoords(GetPlayerPed(src)) - GetEntityCoords(GetPlayerPed(target.source)))
+    if distance > Config.feather.tradeDistance then
+        NotifyClient(src, _U('tradeTooFar'))
+        return false
+    end
+    local result = StablesOrders.Exclusive(character, function()
+        local horse = OwnedHorse(character, data.horseId)
+        if not horse then
+            return StablesCore.Err('not_owner', 'Not the owner.')
+        end
+        local transferred = StablesAssets.Transfer('trade:' .. StablesCore.NewId(), horse,
+            character.characterId, target.characterId, src)
+        if transferred.ok then
+            StablesHorses.ClearSelectionsOf(horse.assetId)
+        end
+        return transferred
+    end)
+    if not result.ok then
+        NotifyClient(src, _U('tradeFailed'))
+        return false
+    end
+    NotifyClient(src, _U('youGave') .. StablesCharacters.GetFullName(target.characterId) .. _U('aHorse'))
+    NotifyClient(target.source, StablesCharacters.GetFullName(character.characterId) .. _U('gaveHorse'))
+    return true
+end)
+
+-- Horse state ---------------------------------------------------------------------
+
+StablesRPC.Register('bcc-stables:SelectHorse', function(data, src)
+    local character = Begin(src)
+    local horse = character and OwnedHorse(character, data.horseId)
+    if not horse then
+        return false
+    end
+    StablesHorses.Select(character.characterId, horse.assetId)
+    return true
+end)
+
+StablesRPC.Register('bcc-stables:GetHorseData', function(_, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    local selectedId = StablesHorses.Selected(character.characterId)
+    if not selectedId then
+        NotifyClient(src, _U('noSelectedHorse'))
+        return false
+    end
+    local asset = StablesAssets.GetOwned(selectedId, character.characterId)
+    if asset.ok and asset.value.status ~= 'active' then
+        NotifyClient(src, _U('noSelectedHorse'))
+        return false
+    end
+    if not asset.ok then
+        if asset.code == 'not_owner' then
+            StablesHorses.ClearSelection(character.characterId)
+            NotifyClient(src, _U('noSelectedHorse'))
+        else
+            NotifyClient(src, _U('stableUnavailable'))
+        end
+        return false
+    end
+    StablesHorses.Ensure(asset.value.assetId, false)
+    return StablesHorses.ToClient(asset.value, StablesHorses.Row(asset.value.assetId), selectedId)
+end)
+
+StablesRPC.Register('bcc-stables:UpdateHorseXp', function(data, src)
+    local character = Begin(src)
+    local horse = character and OwnedHorse(character, data.horseId)
+    if horse then
+        StablesHorses.SaveXp(horse.assetId, data.xp)
+    end
+    return horse ~= nil
+end, { windowMs = 1000, maxCalls = 5, maxPayloadBytes = 256, requireCharacter = true })
+
+StablesRPC.Register('bcc-stables:SaveHorseStats', function(data, src)
+    local character = Begin(src)
+    local horse = character and OwnedHorse(character, data.horseId)
+    if horse then
+        StablesHorses.SaveStats(horse.assetId, data.health, data.stamina)
+    end
+    return horse ~= nil
+end, { windowMs = 1000, maxCalls = 5, maxPayloadBytes = 256, requireCharacter = true })
+
+StablesRPC.Register('bcc-stables:SetHorseWrithe', function(data, src)
+    local character = Begin(src)
+    local horse = character and OwnedHorse(character, data.horseId)
+    if horse and Config.death.persistentWrithe then
+        StablesHorses.SetWrithe(horse.assetId, true)
+    end
+    return horse ~= nil
+end)
+
+-- After death or revive. 'dead' retires the horse only when deaths are
+-- permanent; 'deselect' only when that option is on; nil means revived.
+StablesRPC.Register('bcc-stables:UpdateHorseStatus', function(data, src)
+    local character = Begin(src)
+    local horse = character and OwnedHorse(character, data.horseId)
+    if not horse then
+        return false
+    end
+    StablesHorses.SetWrithe(horse.assetId, false)
+    if data.action == 'dead' and Config.death.permanent then
+        local retired = StablesOrders.Exclusive(character, function()
+            return StablesAssets.Retire('death:' .. horse.assetId, horse.assetId, 'stables.horse_died', src)
+        end)
+        if retired.ok then
+            StablesHorses.ClearSelectionsOf(horse.assetId)
+        end
+        return retired.ok
+    end
+    if data.action == 'deselect' and Config.death.deselect then
+        StablesHorses.ClearSelection(character.characterId)
+    end
+    return true
+end)
+
+StablesRPC.Register('bcc-stables:HorseReviveItem', function(_, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    local removed = StablesInventory.RemoveByName(src, Config.reviver, 1)
+    return removed.ok
+end)
+
+-- Saddlebags ----------------------------------------------------------------------
+-- Own horse: ownership check. Another player's horse (shareInventory): the
+-- player must stand next to that horse entity, whose state names the asset.
+
+StablesRPC.Register('bcc-stables:OpenInventory', function(data, src)
+    local character = Begin(src)
+    if not character or not StablesCore.Uuid(data.horseId) then
+        return false
+    end
+    local assetId = data.horseId:lower()
+    local entity = NearEntity(src, data.netId, Config.feather.lootDistance)
+    if not entity then
+        NotifyClient(src, _U('tooFar'))
+        return false
+    end
+    local asset
+    if data.looting then
+        if not Config.shareInventory or Entity(entity).state.myHorseId ~= assetId then
+            return false
+        end
+        asset = StablesAssets.Get(assetId)
+        if not asset.ok or not asset.value.owner then
+            return false
+        end
+        asset = asset.value
     else
-        cb(false) -- Not on Cooldown
-    end
-end)
-
-Core.Callback.Register('bcc-stables:CheckJob', function(source, cb, trainer, site)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return cb(false) end
-
-    local character = user.getUsedCharacter
-    local jobConfig = trainer and Config.trainerJob or Stables[site].shop.jobs
-
-    local hasJob = false
-    for _, job in pairs(jobConfig) do
-        if (character.job == job.name) and (tonumber(character.jobGrade) >= tonumber(job.grade)) then
-            hasJob = true
-            break
+        asset = OwnedHorse(character, assetId)
+        if not asset then
+            return false
         end
     end
-
-    cb({hasJob, character.job})
+    local registered = StablesInventory.EnsureSaddlebags(asset.assetId, asset.modelKey, asset.owner.holderId)
+    if not registered.ok then
+        NotifyClient(src, _U('stableUnavailable'))
+        return false
+    end
+    return StablesInventory.OpenSaddlebags(src, asset.assetId).ok
 end)
 
-RegisterNetEvent('vorp_core:instanceplayers', function(setRoom)
-    local src = source
-    local user = Core.getUser(src)
-    if not user then return end
+-- Jobs ---------------------------------------------------------------------------
 
-    if setRoom == 0 then
-        Wait(3000)
-        TriggerClientEvent('bcc-stables:UpdateMyHorseEntity', src)
+StablesRPC.Register('bcc-stables:CheckJob', function(data, src)
+    local character = Begin(src)
+    if not character then
+        return false
+    end
+    local jobs = data.trainer and Config.trainerJob or (Stables[data.site] and Stables[data.site].shop.jobs) or {}
+    return {
+        StablesJobs.HasAny(character.characterId, jobs),
+        StablesJobs.Keys(character.characterId)
+    }
+end)
+
+-- Routing: a player returning to the shared world re-resolves their horse entity.
+AddEventHandler('routing.player.left.v1', function(event)
+    local src = type(event) == 'table' and tonumber(event.source) or nil
+    if not src then
+        return
+    end
+    SetTimeout(3000, function()
+        StablesRPC.Notify(src, 'bcc-stables:UpdateMyHorseEntity', {})
+    end)
+end)
+
+-- Startup ------------------------------------------------------------------------
+
+CreateThread(function()
+    local called, result = xpcall(function()
+        if DB.awaitReady(30000) ~= true then
+            return StablesCore.Err('dependency_unavailable', 'Database did not become ready.')
+        end
+        for _, resource in ipairs({ 'feather-assets', 'feather-economy', 'feather-jobs' }) do
+            local ready = StablesCore.Call(resource, 'AwaitReady', 30000)
+            if not ready.ok then
+                return StablesCore.Err('dependency_unavailable', resource .. ' did not become ready.')
+            end
+        end
+        local migrated = StablesMigrations.Run()
+        if not migrated.ok then
+            return migrated
+        end
+        local inventory = StablesInventory.Start()
+        if not inventory.ok then
+            return inventory
+        end
+        StablesItems.Register()
+        StablesCore.ready = true
+        StablesCore.Log('startup.ready', { migrationsApplied = migrated.value.applied })
+        return StablesCore.Ok(true)
+    end, debug.traceback)
+    if not called then
+        print('[bcc-stables] startup traceback: ' .. tostring(result))
+    elseif not result.ok then
+        StablesCore.Log('startup.failed', { code = result.code, message = result.message })
     end
 end)
 
---- Check if properly downloaded
-function file_exists(name)
-    local f = LoadResourceFile(GetCurrentResourceName(), name)
-    return f ~= nil
-end
-
-if not file_exists('./ui/index.html') then
-    print('^1 INCORRECT DOWNLOAD!  ^0')
-    print(
-        '^4 Please Download: ^2(bcc-stables.zip) ^4from ^3<https://github.com/BryceCanyonCounty/bcc-stables/releases/latest>^0')
-end
-
-BccUtils.Versioner.checkFile(GetCurrentResourceName(), 'https://github.com/BryceCanyonCounty/bcc-stables')
+AddEventHandler('onResourceStop', function(resource)
+    if resource == 'feather-assets' or resource == 'feather-economy' or resource == 'feather-inventory'
+        or resource == 'feather-jobs' or resource == 'feather-core' then
+        StablesCore.ready = false
+        StablesCore.Log('dependency.stopped', { resource = resource })
+    end
+end)

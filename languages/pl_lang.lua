@@ -68,15 +68,21 @@ Locales["pl_lang"] = {
     horseInfoTrickLvl_4b = "Krok boczny | spacja + A lub D",
     horseDied = "Twój koń padł, wróć do stajni, aby wybrać innego konia.",
     horseWrithe = "Twój koń potrzebuje pomocy!",
-    -- Discord Alerts
-    discordHorsePurchased = "Zakupiono konia!",
-    discordTamedPurchased = "Zapisano oswojonego konia!",
-    discordHorseXPGain = "Zdobuto XP konia!",
-    discordHorseSold = "Sprzedano konia!",
-    discordTamedSold = "Sprzedano oswojonego konia!",
-    discordTraded = "Przekazano konia graczowi ",
     -- Flaming Hooves
     flameHooveDesc = 'Zaczarowany przedmiot aktywujący płonące kopyta',
     flameHoovesActivated = 'Płonące kopyta aktywowane!',
     flameHoovesDeactivated = 'Płonące kopyta dezaktywowane!',
+    -- Feather Framework
+    moneyUnavailable = "Payments are unavailable right now, try again later",
+    transactionFailed = "The transaction could not be completed",
+    purchasePending = "Your last purchase is still being processed, try again shortly",
+    saleUnavailable = "The stable can't buy horses right now",
+    invalidHorseName = "That name can't be used",
+    notYourHorse = "That horse doesn't belong to you",
+    tradeTooFar = "The other player is too far away",
+    tradeFailed = "The trade could not be completed",
+    stableUnavailable = "The stable is unavailable right now",
+    emptySaddlebags = "Empty the saddlebags before selling this horse",
+    chatSuggestionHorseRespawn = "Przywołaj ponownie konia, jeśli utknął",
+    chatSuggestionHorseInfo = "Pokaż szczegółowe informacje o koniu",
 }

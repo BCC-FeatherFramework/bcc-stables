@@ -71,20 +71,32 @@ Gain XP by riding, feeding, watering, and brushing your horse. As XP is gained, 
 
 ## Dependencies
 
-- [vorp_core](https://github.com/VORPCORE/vorp-core-lua)
-- [vorp_inventory](https://github.com/VORPCORE/vorp_inventory-lua)
-- [bcc-utils](https://github.com/BryceCanyonCounty/bcc-utils)
-- [feather-menu](https://github.com/FeatherFramework/feather-menu/releases)
+This version runs on the Feather Framework. See [FEATHER_PORT.md](FEATHER_PORT.md)
+for what moved to which Feather resource.
+
+- feather-mysql
+- feather-core
+- feather-character
+- feather-notify
+- feather-menu-v2
+- feather-assets (horse ownership)
+- feather-economy (cash and gold)
+- feather-inventory (saddlebags and horse items)
+- feather-jobs (trainer and job-locked stables)
 
 ## Installation
 
-1. Make sure dependencies are installed/updated and ensured before this script.
-2. Download the latest release `bcc-stables.zip` at [/releases/latest](https://github.com/BryceCanyonCounty/bcc-stables/releases/latest).
-3. Add the `bcc-stables` folder to your resources folder.
-4. Add `ensure bcc-stables` to your `server.cfg`.
-5. Run the included database file `bcc-stables.sql`.
-6. Add images from the `img` folder to: `...\vorp_inventory\html\img\items`.
-7. Restart the server.
+1. Make sure the dependencies are installed and start before this script.
+2. Apply `sql/install_items.sql` to the database once (adds the horse items to
+   feather-inventory; safe to run again).
+3. Copy any image from `img/` that feather-inventory does not have yet into
+   `feather-inventory/ui/images/items/`.
+4. Add `ensure bcc-stables` to `server.cfg` after the Feather domain resources
+   and `feather-admin`.
+5. Restart the server and run `StablesReleaseSmokeTest` in the server console.
+
+The stable creates its own tables on first start. It never stores horse owners
+or balances; those live in feather-assets and feather-economy.
 
 ## Credits
 
