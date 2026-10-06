@@ -1,0 +1,13 @@
+<2.0.0>
+- Feather Framework port: horses in feather-assets, money in feather-economy,
+  saddlebags and items in feather-inventory, jobs in feather-jobs
+- Server-side pricing, ownership, distance and job checks
+- See FEATHER_PORT.md
+
+<1.7.5>
+- Fix horse component loading after server restart
+- Add temporary work around for horse health issue
+- Fix job matched horses when menu is displayed
+
+<1.7.4>
+- Add missing comma in sql file
