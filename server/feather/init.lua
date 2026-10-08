@@ -22,7 +22,10 @@ function DebugPrint(...)
         local value = select(index, ...)
         parts[#parts + 1] = type(value) == 'table' and json.encode(value) or tostring(value)
     end
-    print('^1[DEV MODE] ^4' .. table.concat(parts, ' ') .. '^0')
+    -- One print per line, each ending with ^0 so the color never carries over.
+    for line in (table.concat(parts, ' ') .. '\n'):gmatch('(.-)\n') do
+        print('^1[DEV MODE] ^4' .. line .. '^0')
+    end
 end
 
 function StablesCore.Log(event, fields)
