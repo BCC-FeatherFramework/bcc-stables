@@ -36,7 +36,10 @@ local DevModeActive = Config.devMode
 
 function DebugPrint(message)
     if DevModeActive then
-        print('^1[DEV MODE] ^4' .. message)
+        -- One print per line, each ending with ^0 so the color never carries over.
+        for line in (tostring(message) .. '\n'):gmatch('(.-)\n') do
+            print('^1[DEV MODE] ^4' .. line .. '^0')
+        end
     end
 end
 
