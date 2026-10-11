@@ -91,6 +91,8 @@ The VORP version trusted several client values. The port recomputes them:
 - **Item use** is confirmed by the client before food is consumed or a tool wears,
   and only for the instance the player actually used.
 - A horse with items in its saddlebags cannot be sold.
+- Equipped weapons cannot be put in saddlebags: feather-weapons refuses the move and
+  feather-inventory shows "Unequip this item before moving or removing it.".
 
 ## Sales need an Economy decision
 
