@@ -195,6 +195,10 @@ sold and retired with it), then retires it as a permanent death and checks a
 non-owner cannot. `StablesReleaseSmokeTest` checks the command is absent with
 DevMode off (8 checks).
 
+Passed 12/12 on 2026-10-13 with both characters offline: capture registration
+($25 charged), trade, former owner refused, sale refused with the horse kept (no
+supply grant yet), non-owner retirement refused, death retirement.
+
 Still to test on the server:
 
 1. In game:
