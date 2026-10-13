@@ -214,7 +214,7 @@ local function TameRules(character, model)
         return nil
     end
     return {
-        model = data.ModelH,
+        model = model,
         currency = currency,
         amount = amount.value,
         captured = true,
