@@ -8,6 +8,11 @@
 StablesCore.ready = false
 local cooldowns = {} -- 'type:characterId' -> os.time()
 
+-- Flows shared by the RPC handlers and the console tests. They take a character
+-- ({ characterId, source? }) and work while it is offline; position checks
+-- (near a stable, trainer or the other player) stay in the RPC handlers.
+StablesFlows = {}
+
 -- Helpers ------------------------------------------------------------------------
 
 local function HorseConfig(model)
@@ -186,8 +191,9 @@ local function PurchasePayload(character, data)
 end
 
 -- Validates registering a tamed horse and returns its order payload, or nil.
-local function TamePayload(character, data)
-    if not Config.allowKeep or not HorseConfig(data.ModelH) or not NearTrainer(character.source) then
+-- Registration rules for a tamed horse, without the position check.
+local function TameRules(character, model)
+    if not Config.allowKeep or not HorseConfig(model) then
         return nil
     end
     local trainer = IsTrainer(character)
@@ -217,6 +223,13 @@ local function TamePayload(character, data)
     }
 end
 
+local function TamePayload(character, data)
+    if not NearTrainer(character.source) then
+        return nil
+    end
+    return TameRules(character, data.ModelH)
+end
+
 local function NotifyOrderFailure(src, result, currency)
     if result.code == 'order_pending' then
         NotifyClient(src, _U('purchasePending'))
@@ -235,6 +248,78 @@ local function OwnedHorse(character, horseId)
         return nil
     end
     return asset.value
+end
+
+-- Registers a captured horse for the character (charges Config.regCost).
+function StablesFlows.Tame(character, model, name, gender)
+    local payload = TameRules(character, model)
+    if not payload then
+        return StablesCore.Err('not_allowed', 'This horse cannot be registered now.')
+    end
+    payload.name = name
+    payload.gender = Gender(gender)
+    return StablesOrders.Run(character, 'tame_register', payload)
+end
+
+-- Moves an owned horse to another character, under the owner's order lock.
+function StablesFlows.Trade(character, targetCharacterId, horseId)
+    return StablesOrders.Exclusive(character, function()
+        local horse = OwnedHorse(character, horseId)
+        if not horse then
+            return StablesCore.Err('not_owner', 'Not the owner.')
+        end
+        local transferred = StablesAssets.Transfer('trade:' .. StablesCore.NewId(), horse,
+            character.characterId, targetCharacterId, character.source)
+        if transferred.ok then
+            StablesHorses.ClearSelectionsOf(horse.assetId)
+        end
+        return transferred
+    end)
+end
+
+-- Retires an owned horse that died permanently. Replays by its request ID.
+function StablesFlows.RetireDead(character, horseId)
+    local horse = OwnedHorse(character, horseId)
+    if not horse then
+        return StablesCore.Err('not_owner', 'Not the owner.')
+    end
+    local retired = StablesOrders.Exclusive(character, function()
+        return StablesAssets.Retire('death:' .. horse.assetId, horse.assetId, 'stables.horse_died', character.source)
+    end)
+    if retired.ok then
+        StablesHorses.ClearSelectionsOf(horse.assetId)
+    end
+    return retired
+end
+
+-- Sells an owned horse to the stable: payout, then the horse is retired.
+-- Returns the result, the currency and the amount in minor units.
+function StablesFlows.Sell(character, horseId)
+    local horse = OwnedHorse(character, horseId)
+    if not horse then
+        return StablesCore.Err('not_owner', 'Not the owner.')
+    end
+    local colorCfg = HorseConfig(horse.modelKey)
+    if not colorCfg then
+        return StablesCore.Err('invalid_input', 'Horse model is not configured.')
+    end
+    local empty = StablesInventory.IsEmpty(horse.assetId)
+    if not empty.ok or not empty.value then
+        return StablesCore.Err('saddlebags_not_empty', 'Empty the saddlebags first.')
+    end
+    local row = StablesHorses.Row(horse.assetId) or {}
+    local multiplier = tonumber(row.captured) == 1 and Config.tamedSellPrice or Config.sellPrice
+    local currency = StablesEconomy.Currency('cash')
+    local amount = StablesEconomy.ToMinor(currency, multiplier * colorCfg.cashPrice)
+    if not amount.ok then
+        return amount
+    end
+    return StablesOrders.Run(character, 'sale', {
+        assetId = horse.assetId,
+        currency = currency,
+        amount = amount.value,
+        reasonCode = 'stables.horse_sale'
+    }), currency, amount.value
 end
 
 -- Shop and purchases ---------------------------------------------------------------
@@ -300,15 +385,14 @@ StablesRPC.Register('bcc-stables:SaveTamedHorse', function(data, src)
         NotifyClient(src, _U('invalidHorseName'))
         return false
     end
-    local payload = TamePayload(character, data)
-    if not payload then
+    if not NearTrainer(src) then
         return false
     end
-    payload.name = name
-    payload.gender = Gender(data.gender)
-    local result = StablesOrders.Run(character, 'tame_register', payload)
+    local result = StablesFlows.Tame(character, data.ModelH, name, data.gender)
     if not result.ok then
-        NotifyOrderFailure(src, result, payload.currency)
+        if result.code ~= 'not_allowed' then
+            NotifyOrderFailure(src, result, StablesEconomy.Currency('cash'))
+        end
         return false
     end
     return true
@@ -404,41 +488,18 @@ StablesRPC.Register('bcc-stables:SellMyHorse', function(data, src)
     if not NearStable(src, data.site) then
         return false
     end
-    local horse = OwnedHorse(character, data.horseId)
-    if not horse then
-        return false
-    end
-    local colorCfg = HorseConfig(horse.modelKey)
-    if not colorCfg then
-        return false
-    end
-    local empty = StablesInventory.IsEmpty(horse.assetId)
-    if not empty.ok or not empty.value then
-        NotifyClient(src, _U('emptySaddlebags'))
-        return false
-    end
-    local row = StablesHorses.Row(horse.assetId) or {}
-    local multiplier = tonumber(row.captured) == 1 and Config.tamedSellPrice or Config.sellPrice
-    local currency = StablesEconomy.Currency('cash')
-    local amount = StablesEconomy.ToMinor(currency, multiplier * colorCfg.cashPrice)
-    if not amount.ok then
-        return false
-    end
-    local result = StablesOrders.Run(character, 'sale', {
-        assetId = horse.assetId,
-        currency = currency,
-        amount = amount.value,
-        reasonCode = 'stables.horse_sale'
-    })
+    local result, currency, amount = StablesFlows.Sell(character, data.horseId)
     if not result.ok then
-        if result.code == 'authorization_denied' then
+        if result.code == 'saddlebags_not_empty' then
+            NotifyClient(src, _U('emptySaddlebags'))
+        elseif result.code == 'authorization_denied' then
             NotifyClient(src, _U('saleUnavailable'))
-        else
+        elseif currency then
             NotifyOrderFailure(src, result, currency)
         end
         return false
     end
-    NotifyClient(src, _U('soldHorse') .. StablesEconomy.FormatMinor(currency, amount.value))
+    NotifyClient(src, _U('soldHorse') .. StablesEconomy.FormatMinor(currency, amount))
     return true
 end)
 
@@ -507,18 +568,7 @@ StablesRPC.Register('bcc-stables:SaveHorseTrade', function(data, src)
         NotifyClient(src, _U('tradeTooFar'))
         return false
     end
-    local result = StablesOrders.Exclusive(character, function()
-        local horse = OwnedHorse(character, data.horseId)
-        if not horse then
-            return StablesCore.Err('not_owner', 'Not the owner.')
-        end
-        local transferred = StablesAssets.Transfer('trade:' .. StablesCore.NewId(), horse,
-            character.characterId, target.characterId, src)
-        if transferred.ok then
-            StablesHorses.ClearSelectionsOf(horse.assetId)
-        end
-        return transferred
-    end)
+    local result = StablesFlows.Trade(character, target.characterId, data.horseId)
     if not result.ok then
         NotifyClient(src, _U('tradeFailed'))
         return false
@@ -605,13 +655,7 @@ StablesRPC.Register('bcc-stables:UpdateHorseStatus', function(data, src)
     end
     StablesHorses.SetWrithe(horse.assetId, false)
     if data.action == 'dead' and Config.death.permanent then
-        local retired = StablesOrders.Exclusive(character, function()
-            return StablesAssets.Retire('death:' .. horse.assetId, horse.assetId, 'stables.horse_died', src)
-        end)
-        if retired.ok then
-            StablesHorses.ClearSelectionsOf(horse.assetId)
-        end
-        return retired.ok
+        return StablesFlows.RetireDead(character, horse.assetId).ok
     end
     if data.action == 'deselect' and Config.death.deselect then
         StablesHorses.ClearSelection(character.characterId)

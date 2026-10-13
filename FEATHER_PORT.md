@@ -163,7 +163,7 @@ character UUIDs and registers each row with provenance `legacy_player_horses`.
 | `server/items.lua` | Usable items |
 | `server/commands.lua` | Order reconciliation console commands |
 | `server/chat_suggestions.lua` | feather-chat suggestions for `/horseRespawn` and `/horseInfo` |
-| `server/tests.lua` | `StablesReleaseSmokeTest` |
+| `server/tests.lua` | `StablesReleaseSmokeTest`; `StablesFlowTest` (DevMode) |
 | `client/feather/init.lua` | Client RPC and notifications |
 | `client/menus/horse_info.lua` | Horse info panel on feather-menu-v2 |
 | `sql/install_items.sql` | Item definitions for feather-inventory |
@@ -177,6 +177,23 @@ Done (2026-10-03):
 - `StablesReleaseSmokeTest` 7/7.
 - In game: cash purchase ($140, priced from config), tack ($30 for three new
   pieces, priced on the server), saddlebags opened (container linked to the asset).
+
+### Console flow test (DevMode, nobody online)
+
+With `Config.devMode = true`:
+
+```text
+StablesFlowTest <serverId|characterUuid> <otherServerId|otherCharacterUuid>
+```
+
+It runs the same flows as the in-game handlers (`StablesFlows.Tame`, `Trade`,
+`Sell`, `RetireDead` in `server/main.lua`), without the position checks: it
+registers a captured horse for the first character (charges `Config.regCost`),
+trades it to the second, checks the former owner can no longer trade it, tries a
+sale (refused and the horse kept while bcc-stables has no Economy supply grant;
+sold and retired with it), then retires it as a permanent death and checks a
+non-owner cannot. `StablesReleaseSmokeTest` checks the command is absent with
+DevMode off (8 checks).
 
 Still to test on the server:
 
