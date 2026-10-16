@@ -94,20 +94,15 @@ The VORP version trusted several client values. The port recomputes them:
 - Equipped weapons cannot be put in saddlebags: feather-weapons refuses the move and
   feather-inventory shows "Unequip this item before moving or removing it.".
 
-## Sales need an Economy decision
+## Sales
 
-Selling a horse (stable or trainer) pays the player with Economy `Issue`. Economy
-only allows trusted suppliers to create currency, and bcc-stables is **not**
-granted that. Until the team decides, sales fail safely: the order is rejected,
-the horse is kept, and the player sees "The stable can't buy horses right now".
-This matches the bcc-shops position on NPC payouts.
-
-To enable sales, the team chooses one of:
-
-1. Add `bcc-stables` to Economy `trustedSuppliers` and grant
-   `economy.currency.issue` to it in the feather-admin service policy.
-2. Add a per-resource, per-reason allow-list in Economy (like `BankSupply`) for
-   `stables.horse_sale` and `stables.tamed_sale`.
+Selling a horse (stable or trainer) pays the player with Economy `Issue`.
+bcc-stables is not a trusted supplier: Economy's `Config.IssueReasons` lets it
+issue only with `stables.horse_sale` and `stables.tamed_sale`, into a character
+wallet, and feather-admin grants it `economy.currency.issue`. Without those two
+entries a sale fails safely: the order is rejected, the horse is kept, and the
+player sees "The stable can't buy horses right now". `StablesFlowTest` sold and
+retired a horse on 2026-10-16.
 
 ## Trust and policy grants (already applied)
 
@@ -115,7 +110,8 @@ To enable sales, the team chooses one of:
 |---|---|---|
 | feather-assets | `Config.Access` | `trustedReaders`, `trustedManagers`, `trustedAuditors` |
 | feather-admin | `Config.servicePolicy['feather-assets']` | `assets.asset.manage`, `assets.ownership.transfer` |
-| feather-economy | `Config.Access` | `trustedReaders`, `trustedProvisioners`, `trustedTransactors` (not suppliers) |
+| feather-economy | `Config.Access`; `Config.IssueReasons` | `trustedReaders`, `trustedProvisioners`, `trustedTransactors` (not suppliers); issue reasons `stables.horse_sale`, `stables.tamed_sale` |
+| feather-admin | `Config.servicePolicy['feather-economy']` | `['bcc-stables']['economy.currency.issue']` (horse sales) |
 | feather-jobs | `Config.Access` | `trustedReaders` |
 
 Restart feather-assets, feather-economy, feather-jobs and feather-admin after
